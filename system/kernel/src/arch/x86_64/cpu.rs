@@ -217,6 +217,14 @@ impl Cpu {
     }
 
     #[inline]
+    pub(crate) unsafe fn broadcast_schedule() -> Result<(), ()> {
+        match Apic::broadcast_schedule() {
+            true => Ok(()),
+            false => Err(()),
+        }
+    }
+
+    #[inline]
     pub fn spin_loop_hint() {
         unsafe {
             asm!("pause", options(nomem, nostack));
@@ -461,7 +469,7 @@ macro_rules! without_interrupts {
 
 impl PciImpl for Cpu {
     #[inline]
-    unsafe fn read_pci(&self, addr: PciConfigAddressSpace) -> u32 {
+    unsafe fn read_pci(&self, addr: PciConfigAddress) -> u32 {
         without_interrupts!({
             Cpu::out32(0xCF8, addr.into());
             Cpu::in32(0xCFC)
@@ -469,7 +477,7 @@ impl PciImpl for Cpu {
     }
 
     #[inline]
-    unsafe fn write_pci(&self, addr: PciConfigAddressSpace, value: u32) {
+    unsafe fn write_pci(&self, addr: PciConfigAddress, value: u32) {
         without_interrupts!({
             Cpu::out32(0xCF8, addr.into());
             Cpu::out32(0xCFC, value);
@@ -477,13 +485,14 @@ impl PciImpl for Cpu {
     }
 }
 
-impl Into<u32> for PciConfigAddressSpace {
+impl Into<u32> for PciConfigAddress {
+    #[inline]
     fn into(self) -> u32 {
         0x8000_0000
-            | ((self.bus as u32) << 16)
-            | ((self.dev as u32) << 11)
-            | ((self.fun as u32) << 8)
-            | ((self.register as u32) << 2)
+            | ((self.get_bus() as u32) << 16)
+            | ((self.get_dev() as u32) << 11)
+            | ((self.get_fun() as u32) << 8)
+            | ((self.get_register() as u32) << 2)
     }
 }
 
@@ -928,6 +937,7 @@ pub struct InterruptVector(pub u8);
 
 impl InterruptVector {
     pub const IPI_INVALIDATE_TLB: Self = Self(0xEE);
+    pub const IPI_SCHEDULE: Self = Self(0xFC);
 }
 
 #[repr(u8)]

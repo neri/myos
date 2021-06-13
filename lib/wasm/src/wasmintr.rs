@@ -1,26 +1,29 @@
-// Wasm Intermediate Code Interpreter
+//! WebAssembly Intermediate Code Interpreter
 
 use super::{intcode::*, stack::*, wasm::*};
-use crate::*;
+use crate::opcode::WasmOpcode;
 use alloc::vec::Vec;
-use core::fmt::Debug;
+use core::fmt;
 
 type StackType = usize;
 
 /// Wasm Intermediate Code
 #[derive(Debug, Clone, Copy)]
 pub struct WasmImc {
-    pub position: usize,
+    pub source: u32,
     pub mnemonic: WasmIntMnemonic,
     pub stack_level: StackType,
     pub param1: u64,
 }
 
 impl WasmImc {
+    /// Maximum size of a byte code
+    pub const MAX_SOURCE_SIZE: usize = 0xFF_FF_FF;
+
     #[inline]
     pub fn from_mnemonic(mnemonic: WasmIntMnemonic) -> Self {
         Self {
-            position: 0,
+            source: 0,
             mnemonic,
             stack_level: StackType::default(),
             param1: 0,
@@ -29,22 +32,29 @@ impl WasmImc {
 
     #[inline]
     pub const fn new(
-        position: usize,
-        opcode: WasmIntMnemonic,
+        source_position: usize,
+        opcode: WasmOpcode,
+        mnemonic: WasmIntMnemonic,
         stack_level: usize,
         param1: u64,
     ) -> Self {
+        let source = ((source_position as u32) << 8) | (opcode as u32);
         Self {
-            position,
-            mnemonic: opcode,
+            source,
+            mnemonic,
             stack_level: stack_level as StackType,
             param1,
         }
     }
 
     #[inline]
-    pub const fn position(&self) -> usize {
-        self.position
+    pub const fn source_position(&self) -> usize {
+        (self.source >> 8) as usize
+    }
+
+    #[inline]
+    pub const fn opcode(&self) -> Option<WasmOpcode> {
+        WasmOpcode::new(self.source as u8)
     }
 
     #[inline]
@@ -79,8 +89,6 @@ impl From<WasmIntMnemonic> for WasmImc {
 pub struct WasmInterpreter<'a> {
     module: &'a WasmModule,
     func_index: usize,
-    last_postion: usize,
-    last_code: WasmImc,
 }
 
 impl<'a> WasmInterpreter<'a> {
@@ -89,8 +97,6 @@ impl<'a> WasmInterpreter<'a> {
         Self {
             module,
             func_index: 0,
-            last_postion: 0,
-            last_code: WasmImc::from_mnemonic(WasmIntMnemonic::Unreachable),
         }
     }
 }
@@ -99,49 +105,58 @@ impl WasmInterpreter<'_> {
     pub fn invoke(
         &mut self,
         func_index: usize,
-        info: &WasmBlockInfo,
+        code_block: &WasmCodeBlock,
         locals: &[WasmStackValue],
         result_types: &[WasmValType],
-    ) -> Result<WasmValue, WasmIntrError> {
-        let mut stack = SharedStack::with_capacity(0x10000);
+    ) -> Result<Option<WasmValue>, WasmRuntimeError> {
+        let mut heap = StackHeap::with_capacity(0x10000);
 
         let mut locals = {
-            let output = stack.alloc(locals.len());
+            let output = heap.alloc(locals.len());
             output.copy_from_slice(locals);
             output
         };
 
         self.func_index = func_index;
 
-        self.interpret(info, &mut locals, result_types, &mut stack)
-            .map_err(|v| WasmIntrError {
-                kind: v,
-                function: self.func_index,
-                code: self.last_code,
-            })
+        self.interpret(code_block, &mut locals, result_types, &mut heap)
+    }
+
+    #[inline]
+    fn error(&self, kind: WasmRuntimeErrorType, code: &WasmImc) -> WasmRuntimeError {
+        WasmRuntimeError {
+            kind,
+            function: self.func_index,
+            position: code.source_position(),
+            opcode: code.opcode().unwrap_or(WasmOpcode::Unreachable),
+        }
     }
 
     fn interpret(
         &mut self,
-        info: &WasmBlockInfo,
+        code_block: &WasmCodeBlock,
         locals: &mut [WasmStackValue],
         result_types: &[WasmValType],
-        stack: &mut SharedStack,
-    ) -> Result<WasmValue, WasmRuntimeError> {
-        let mut codes = WasmIntermediateCodeBlock::from_codes(info.intermediate_codes());
+        heap: &mut StackHeap,
+    ) -> Result<Option<WasmValue>, WasmRuntimeError> {
+        let mut codes = WasmIntermediateCodeStream::from_codes(code_block.intermediate_codes());
 
-        let value_stack = stack.alloc(info.max_stack());
+        let value_stack = heap.alloc(code_block.max_value_stack());
         for value in value_stack.iter_mut() {
             *value = WasmStackValue::zero();
         }
 
         let mut result_stack_level = 0;
 
+        // let mut last_code = WasmImc::from_mnemonic(WasmIntMnemonic::Unreachable);
+
+        let memory = unsafe { self.module.memory_unchecked(0) };
+
         while let Some(code) = codes.fetch() {
-            // self.last_postion = code.position();
-            // self.last_code = code;
             match code.mnemonic() {
-                WasmIntMnemonic::Unreachable => return Err(WasmRuntimeError::Unreachable),
+                WasmIntMnemonic::Unreachable => {
+                    return Err(self.error(WasmRuntimeErrorType::Unreachable, code))
+                }
 
                 // Currently, NOP is unreachable
                 WasmIntMnemonic::Nop => unreachable!(),
@@ -160,7 +175,7 @@ impl WasmInterpreter<'_> {
                 }
                 WasmIntMnemonic::BrTable => {
                     let mut index = value_stack[code.stack_level()].get_u32() as usize;
-                    let ext_params = info.ext_params();
+                    let ext_params = code_block.ext_params();
                     let table_position = code.param1() as usize;
                     let table_len = ext_params[table_position] - 1;
                     if index >= table_len {
@@ -171,1161 +186,817 @@ impl WasmInterpreter<'_> {
                 }
 
                 WasmIntMnemonic::Return => {
+                    // last_code = *code;
                     result_stack_level = code.stack_level();
                     break;
                 }
 
                 WasmIntMnemonic::Call => {
-                    let func = self
-                        .module
-                        .functions()
-                        .get(code.param1() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    self.call(func, code.stack_level(), value_stack, stack)?;
+                    let func = unsafe {
+                        self.module
+                            .functions()
+                            .get_unchecked(code.param1() as usize)
+                    };
+                    self.call(func, code, value_stack, heap)?;
                 }
                 WasmIntMnemonic::CallIndirect => {
-                    let stack_level = code.stack_level();
                     let type_index = code.param1() as usize;
-                    let index = value_stack
-                        .get(stack_level)
-                        .map(|v| v.get_i32() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let index =
+                        unsafe { value_stack.get_unchecked(code.stack_level()).get_i32() as usize };
                     let func = self
                         .module
                         .elem_by_index(index)
-                        .ok_or(WasmRuntimeError::NoMethod)?;
+                        .ok_or(self.error(WasmRuntimeErrorType::NoMethod, code))?;
                     if func.type_index() != type_index {
-                        return Err(WasmRuntimeError::TypeMismatch);
+                        return Err(self.error(WasmRuntimeErrorType::TypeMismatch, code));
                     }
-                    self.call(func, stack_level, value_stack, stack)?;
+                    self.call(func, code, value_stack, heap)?;
                 }
 
                 WasmIntMnemonic::Select => {
                     let stack_level = code.stack_level();
-                    let cc = value_stack
-                        .get(stack_level + 2)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_bool();
+                    let cc = unsafe { value_stack.get_unchecked(stack_level + 2).get_bool() };
                     if !cc {
-                        let b = *value_stack
-                            .get(stack_level + 1)
-                            .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                        let ref_a = value_stack
-                            .get_mut(stack_level)
-                            .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                        *ref_a = b;
+                        unsafe {
+                            let b = *value_stack.get_unchecked(stack_level + 1);
+                            let ref_a = value_stack.get_unchecked_mut(stack_level);
+                            *ref_a = b;
+                        }
                     }
                 }
 
                 WasmIntMnemonic::LocalGet => {
-                    let local = locals
-                        .get(code.param1() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let ref_a = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let local = unsafe { locals.get_unchecked(code.param1() as usize) };
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *ref_a = *local;
                 }
                 WasmIntMnemonic::LocalSet | WasmIntMnemonic::LocalTee => {
-                    let local = locals
-                        .get_mut(code.param1() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let a = value_stack
-                        .get(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    *local = *a;
+                    let local = unsafe { locals.get_unchecked_mut(code.param1() as usize) };
+                    let ref_a = unsafe { value_stack.get_unchecked(code.stack_level()) };
+                    *local = *ref_a;
                 }
 
                 WasmIntMnemonic::GlobalGet => {
-                    let global = self
-                        .module
-                        .global(code.param1() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .value()
-                        .try_borrow()
-                        .map_err(|_| WasmRuntimeError::InternalInconsistency)?;
-                    let ref_a = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
-                    *ref_a = WasmStackValue::from(*global);
+                    let global =
+                        unsafe { self.module.globals().get_unchecked(code.param1() as usize) };
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
+                    *ref_a = WasmValue::from(*global.value()).into();
                 }
                 WasmIntMnemonic::GlobalSet => {
-                    let global = self
-                        .module
-                        .global(code.param1() as usize)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let mut var = global
-                        .value()
-                        .try_borrow_mut()
-                        .map_err(|_| WasmRuntimeError::InternalInconsistency)?;
-                    let ref_a = value_stack
-                        .get(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
-                    *var = ref_a.into_value(global.val_type())
+                    let global =
+                        unsafe { self.module.globals().get_unchecked(code.param1() as usize) };
+                    let ref_a = unsafe { value_stack.get_unchecked(code.stack_level()) };
+                    global.set(|v| *v = ref_a.get_by_type(global.val_type()));
                 }
 
                 WasmIntMnemonic::I32Load => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u32(offset)?);
+                    *var = match memory.read_u32(offset).map(|v| WasmStackValue::from(v)) {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I32Load8S => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u8(offset)? as i8 as i32);
+                    *var = match memory
+                        .read_u8(offset)
+                        .map(|v| WasmStackValue::from(v as i8 as i32))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I32Load8U => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u8(offset)? as u32);
+                    *var = match memory
+                        .read_u8(offset)
+                        .map(|v| WasmStackValue::from(v as u32))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I32Load16S => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u16(offset)? as i16 as i32);
+                    *var = match memory
+                        .read_u16(offset)
+                        .map(|v| WasmStackValue::from(v as i16 as i32))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I32Load16U => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u16(offset)? as u32);
+                    *var = match memory
+                        .read_u16(offset)
+                        .map(|v| WasmStackValue::from(v as u32))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
 
                 WasmIntMnemonic::I64Load => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u64(offset)?);
+                    *var = match memory.read_u64(offset).map(|v| WasmStackValue::from(v)) {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load8S => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u8(offset)? as i8 as i64);
+                    *var = match memory
+                        .read_u8(offset)
+                        .map(|v| WasmStackValue::from(v as i8 as i64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load8U => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u8(offset)? as u64);
+                    *var = match memory
+                        .read_u8(offset)
+                        .map(|v| WasmStackValue::from(v as u64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load16S => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u16(offset)? as i16 as i64);
+                    *var = match memory
+                        .read_u16(offset)
+                        .map(|v| WasmStackValue::from(v as i16 as i64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load16U => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u16(offset)? as u64);
+                    *var = match memory
+                        .read_u16(offset)
+                        .map(|v| WasmStackValue::from(v as u64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load32S => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u32(offset)? as i32 as i64);
+                    *var = match memory
+                        .read_u32(offset)
+                        .map(|v| WasmStackValue::from(v as i32 as i64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
                 WasmIntMnemonic::I64Load32U => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     let offset = code.param1() as usize + var.get_u32() as usize;
-                    *var = WasmStackValue::from(memory.read_u32(offset)? as u64);
+                    *var = match memory
+                        .read_u32(offset)
+                        .map(|v| WasmStackValue::from(v as u64))
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err(self.error(e, code)),
+                    };
                 }
 
                 WasmIntMnemonic::I64Store32 | WasmIntMnemonic::I32Store => {
                     let stack_level = code.stack_level();
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let index = value_stack
-                        .get(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32() as usize;
-                    let data = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32();
+                    let index =
+                        unsafe { value_stack.get_unchecked(stack_level).get_u32() as usize };
+                    let data = unsafe { value_stack.get_unchecked(stack_level + 1).get_u32() };
                     let offset = code.param1() as usize + index;
-                    memory.write_u32(offset, data)?;
+                    match memory.write_u32(offset, data) {
+                        Ok(_) => {}
+                        Err(e) => return Err(self.error(e, code)),
+                    }
                 }
                 WasmIntMnemonic::I64Store8 | WasmIntMnemonic::I32Store8 => {
                     let stack_level = code.stack_level();
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let index = value_stack
-                        .get(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32() as usize;
-                    let data = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u8();
+                    let index =
+                        unsafe { value_stack.get_unchecked(stack_level).get_u32() as usize };
+                    let data = unsafe { value_stack.get_unchecked(stack_level + 1).get_u8() };
                     let offset = code.param1() as usize + index;
-                    memory.write_u8(offset, data)?;
+                    match memory.write_u8(offset, data) {
+                        Ok(_) => {}
+                        Err(e) => return Err(self.error(e, code)),
+                    }
                 }
                 WasmIntMnemonic::I64Store16 | WasmIntMnemonic::I32Store16 => {
                     let stack_level = code.stack_level();
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let index = value_stack
-                        .get(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32() as usize;
-                    let data = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u16();
+                    let index =
+                        unsafe { value_stack.get_unchecked(stack_level).get_u32() as usize };
+                    let data = unsafe { value_stack.get_unchecked(stack_level + 1).get_u16() };
                     let offset = code.param1() as usize + index;
-                    memory.write_u16(offset, data)?;
+                    match memory.write_u16(offset, data) {
+                        Ok(_) => {}
+                        Err(e) => return Err(self.error(e, code)),
+                    }
                 }
                 WasmIntMnemonic::I64Store => {
                     let stack_level = code.stack_level();
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let index = value_stack
-                        .get(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32() as usize;
-                    let data = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u64();
+                    let index =
+                        unsafe { value_stack.get_unchecked(stack_level).get_u32() as usize };
+                    let data = unsafe { value_stack.get_unchecked(stack_level + 1).get_u64() };
                     let offset = code.param1() as usize + index;
-                    memory.write_u64(offset, data)?;
+                    match memory.write_u64(offset, data) {
+                        Ok(_) => {}
+                        Err(e) => return Err(self.error(e, code)),
+                    }
                 }
 
                 WasmIntMnemonic::MemorySize => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    value_stack
-                        .get_mut(code.stack_level())
-                        .map(|v| *v = WasmStackValue::from(memory.size()))
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
+                    *ref_a = WasmStackValue::from(memory.size() as u32);
                 }
                 WasmIntMnemonic::MemoryGrow => {
-                    let memory = self.module.memory(0).ok_or(WasmRuntimeError::OutOfMemory)?;
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    *var = WasmStackValue::from(memory.grow(var.get_u32() as usize) as u32);
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
+                    *ref_a = WasmStackValue::from(memory.grow(ref_a.get_u32() as usize) as u32);
                 }
 
                 WasmIntMnemonic::I32Const => {
-                    *value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)? =
-                        WasmStackValue::from_u32(code.param1() as u32);
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
+                    *ref_a = WasmStackValue::from_u32(code.param1() as u32);
                 }
                 WasmIntMnemonic::I64Const => {
-                    *value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)? =
-                        WasmStackValue::from_u64(code.param1());
+                    let ref_a = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
+                    *ref_a = WasmStackValue::from_u64(code.param1());
                 }
 
                 WasmIntMnemonic::I32Eqz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_bool(var.get_i32() == 0);
                 }
                 WasmIntMnemonic::I32Eq => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() == rhs.get_u32());
                 }
                 WasmIntMnemonic::I32Ne => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() != rhs.get_u32());
                 }
                 WasmIntMnemonic::I32LtS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i32() < rhs.get_i32());
                 }
                 WasmIntMnemonic::I32LtU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() < rhs.get_u32());
                 }
                 WasmIntMnemonic::I32GtS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i32() > rhs.get_i32());
                 }
                 WasmIntMnemonic::I32GtU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() > rhs.get_u32());
                 }
                 WasmIntMnemonic::I32LeS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i32() <= rhs.get_i32());
                 }
                 WasmIntMnemonic::I32LeU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() <= rhs.get_u32());
                 }
                 WasmIntMnemonic::I32GeS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i32() >= rhs.get_i32());
                 }
                 WasmIntMnemonic::I32GeU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u32() >= rhs.get_u32());
                 }
 
                 WasmIntMnemonic::I32Clz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u32(|v| v.leading_zeros());
                 }
                 WasmIntMnemonic::I32Ctz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u32(|v| v.trailing_zeros());
                 }
                 WasmIntMnemonic::I32Popcnt => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u32(|v| v.count_ones());
                 }
                 WasmIntMnemonic::I32Add => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i32(|lhs| lhs.wrapping_add(rhs.get_i32()));
                 }
                 WasmIntMnemonic::I32Sub => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i32(|lhs| lhs.wrapping_sub(rhs.get_i32()));
                 }
                 WasmIntMnemonic::I32Mul => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i32(|lhs| lhs.wrapping_mul(rhs.get_i32()));
                 }
+
                 WasmIntMnemonic::I32DivS => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_i32();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_i32() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_i32(|lhs| lhs.wrapping_div(rhs));
                 }
                 WasmIntMnemonic::I32DivU => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_u32() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_u32(|lhs| lhs.wrapping_div(rhs));
                 }
                 WasmIntMnemonic::I32RemS => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_i32();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_i32() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_i32(|lhs| lhs.wrapping_rem(rhs));
                 }
                 WasmIntMnemonic::I32RemU => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u32();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_u32() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_u32(|lhs| lhs.wrapping_rem(rhs));
                 }
+
                 WasmIntMnemonic::I32And => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs & rhs.get_u32());
                 }
                 WasmIntMnemonic::I32Or => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs | rhs.get_u32());
                 }
                 WasmIntMnemonic::I32Xor => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs ^ rhs.get_u32());
                 }
                 WasmIntMnemonic::I32Shl => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs << rhs.get_u32());
                 }
                 WasmIntMnemonic::I32ShrS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i32(|lhs| lhs >> rhs.get_i32());
                 }
                 WasmIntMnemonic::I32ShrU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs >> rhs.get_u32());
                 }
                 WasmIntMnemonic::I32Rotl => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs.rotate_left(rhs.get_u32()));
                 }
                 WasmIntMnemonic::I32Rotr => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u32(|lhs| lhs.rotate_right(rhs.get_u32()));
                 }
 
                 WasmIntMnemonic::I64Eqz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_bool(var.get_i64() == 0);
                 }
                 WasmIntMnemonic::I64Eq => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() == rhs.get_u64());
                 }
                 WasmIntMnemonic::I64Ne => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() != rhs.get_u64());
                 }
                 WasmIntMnemonic::I64LtS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i64() < rhs.get_i64());
                 }
                 WasmIntMnemonic::I64LtU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() < rhs.get_u64());
                 }
                 WasmIntMnemonic::I64GtS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i64() > rhs.get_i64());
                 }
                 WasmIntMnemonic::I64GtU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() > rhs.get_u64());
                 }
                 WasmIntMnemonic::I64LeS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i64() <= rhs.get_i64());
                 }
                 WasmIntMnemonic::I64LeU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() <= rhs.get_u64());
                 }
                 WasmIntMnemonic::I64GeS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_i64() >= rhs.get_i64());
                 }
                 WasmIntMnemonic::I64GeU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     *lhs = WasmStackValue::from(lhs.get_u64() >= rhs.get_u64());
                 }
 
                 WasmIntMnemonic::I64Clz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u64(|v| v.leading_zeros() as u64);
                 }
                 WasmIntMnemonic::I64Ctz => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u64(|v| v.trailing_zeros() as u64);
                 }
                 WasmIntMnemonic::I64Popcnt => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     var.map_u64(|v| v.count_ones() as u64);
                 }
                 WasmIntMnemonic::I64Add => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i64(|lhs| lhs.wrapping_add(rhs.get_i64()));
                 }
                 WasmIntMnemonic::I64Sub => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i64(|lhs| lhs.wrapping_sub(rhs.get_i64()));
                 }
                 WasmIntMnemonic::I64Mul => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i64(|lhs| lhs.wrapping_mul(rhs.get_i64()));
                 }
+
                 WasmIntMnemonic::I64DivS => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_i64();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_i64() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_i64(|lhs| lhs.wrapping_div(rhs));
                 }
                 WasmIntMnemonic::I64DivU => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u64();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_u64() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_u64(|lhs| lhs.wrapping_div(rhs));
                 }
                 WasmIntMnemonic::I64RemS => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_i64();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_i64() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_i64(|lhs| lhs.wrapping_rem(rhs));
                 }
                 WasmIntMnemonic::I64RemU => {
                     let stack_level = code.stack_level();
-                    let rhs = value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?
-                        .get_u64();
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { value_stack.get_unchecked(stack_level + 1).get_u64() };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     if rhs == 0 {
-                        return Err(WasmRuntimeError::DivideByZero);
+                        return Err(self.error(WasmRuntimeErrorType::DivideByZero, code));
                     }
                     lhs.map_u64(|lhs| lhs.wrapping_rem(rhs));
                 }
+
                 WasmIntMnemonic::I64And => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs & rhs.get_u64());
                 }
                 WasmIntMnemonic::I64Or => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs | rhs.get_u64());
                 }
                 WasmIntMnemonic::I64Xor => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs ^ rhs.get_u64());
                 }
                 WasmIntMnemonic::I64Shl => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs << rhs.get_u64());
                 }
                 WasmIntMnemonic::I64ShrS => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_i64(|lhs| lhs >> rhs.get_i64());
                 }
                 WasmIntMnemonic::I64ShrU => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs >> rhs.get_u64());
                 }
                 WasmIntMnemonic::I64Rotl => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs.rotate_left(rhs.get_u32()));
                 }
                 WasmIntMnemonic::I64Rotr => {
                     let stack_level = code.stack_level();
-                    let rhs = *value_stack
-                        .get(stack_level + 1)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    let lhs = value_stack
-                        .get_mut(stack_level)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let rhs = unsafe { *value_stack.get_unchecked(stack_level + 1) };
+                    let lhs = unsafe { value_stack.get_unchecked_mut(stack_level) };
                     lhs.map_u64(|lhs| lhs.rotate_right(rhs.get_u32()));
                 }
 
                 WasmIntMnemonic::I64Extend8S => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i64(var.get_i8() as i64);
                 }
                 WasmIntMnemonic::I64Extend16S => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i64(var.get_i16() as i64);
                 }
                 WasmIntMnemonic::I64Extend32S | WasmIntMnemonic::I64ExtendI32S => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i64(var.get_i32() as i64);
                 }
                 WasmIntMnemonic::I64ExtendI32U => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_u64(var.get_u32() as u64);
                 }
                 WasmIntMnemonic::I32WrapI64 => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i32(var.get_i64() as i32);
                 }
                 WasmIntMnemonic::I32Extend8S => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i32(var.get_i8() as i32);
                 }
                 WasmIntMnemonic::I32Extend16S => {
-                    let var = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                    let var = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     *var = WasmStackValue::from_i32(var.get_i16() as i32);
                 }
 
                 WasmIntMnemonic::FusedI32AddI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs.wrapping_add(code.param1() as i32));
                 }
                 WasmIntMnemonic::FusedI32SubI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs.wrapping_sub(code.param1() as i32));
                 }
                 WasmIntMnemonic::FusedI32AndI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs & code.param1() as i32);
                 }
                 WasmIntMnemonic::FusedI32OrI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs | code.param1() as i32);
                 }
                 WasmIntMnemonic::FusedI32XorI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs ^ code.param1() as i32);
                 }
                 WasmIntMnemonic::FusedI32ShlI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_u32(|lhs| lhs << (code.param1() as u32));
                 }
                 WasmIntMnemonic::FusedI32ShrUI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_u32(|lhs| lhs >> (code.param1() as u32));
                 }
                 WasmIntMnemonic::FusedI32ShrSI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i32(|lhs| lhs >> (code.param1() as i32));
                 }
 
                 WasmIntMnemonic::FusedI64AddI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i64(|lhs| lhs.wrapping_add(code.param1() as i64));
                 }
                 WasmIntMnemonic::FusedI64SubI => {
-                    let lhs = value_stack
-                        .get_mut(code.stack_level())
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-
+                    let lhs = unsafe { value_stack.get_unchecked_mut(code.stack_level()) };
                     lhs.map_i64(|lhs| lhs.wrapping_sub(code.param1() as i64));
                 }
 
                 WasmIntMnemonic::FusedI32BrZ => {
-                    let cc = value_stack[code.stack_level()].get_i32() == 0;
+                    let cc =
+                        unsafe { value_stack.get_unchecked_mut(code.stack_level()).get_i32() == 0 };
                     if cc {
                         let br = code.param1() as usize;
                         codes.set_position(br);
                     }
                 }
                 WasmIntMnemonic::FusedI64BrZ => {
-                    let cc = value_stack[code.stack_level()].get_i64() == 0;
+                    let cc =
+                        unsafe { value_stack.get_unchecked_mut(code.stack_level()).get_i64() == 0 };
                     if cc {
                         let br = code.param1() as usize;
                         codes.set_position(br);
                     }
                 }
 
-                #[allow(unreachable_patterns)]
-                _ => return Err(WasmRuntimeError::InvalidBytecode),
+                _ => return Err(self.error(WasmRuntimeErrorType::NotSupprted, code)),
             }
         }
         if let Some(result_type) = result_types.first() {
-            let val = value_stack
-                .get(result_stack_level)
-                .ok_or(WasmRuntimeError::InternalInconsistency)?;
+            let val = unsafe { value_stack.get_unchecked(result_stack_level) };
             match result_type {
-                WasmValType::I32 => Ok(WasmValue::I32(val.get_i32())),
-                WasmValType::I64 => Ok(WasmValue::I64(val.get_i64())),
+                WasmValType::I32 => Ok(Some(WasmValue::I32(val.get_i32()))),
+                WasmValType::I64 => Ok(Some(WasmValue::I64(val.get_i64()))),
                 // WasmValType::F32 => {}
                 // WasmValType::F64 => {}
-                _ => Err(WasmRuntimeError::InvalidParameter),
+                _ => unreachable!(),
             }
         } else {
-            Ok(WasmValue::Empty)
+            Ok(None)
         }
     }
 
     #[inline]
     fn call(
         &mut self,
-        func: &WasmFunction,
-        stack_pointer: usize,
+        target: &WasmFunction,
+        code: &WasmImc,
         value_stack: &mut [WasmStackValue],
-        stack: &mut SharedStack,
+        heap: &mut StackHeap,
     ) -> Result<(), WasmRuntimeError> {
+        let stack_pointer = code.stack_level();
         let current_function = self.func_index;
         let module = self.module;
-        let result_types = func.result_types();
+        let result_types = target.result_types();
 
-        let param_len = func.param_types().len();
-        if stack_pointer < param_len {
-            return Err(WasmRuntimeError::InternalInconsistency);
-        }
+        let param_len = target.param_types().len();
+        // if stack_pointer < param_len {
+        //     return Err(self.error(WasmRuntimeError::InternalInconsistency, code));
+        // }
 
-        if let Some(body) = func.body() {
-            stack.snapshot(|stack| {
-                let info = body.block_info();
-                let mut locals = stack.alloc_stack(param_len + body.local_types().len());
+        if let Some(code_block) = target.code_block() {
+            heap.snapshot(|heap| {
+                let mut locals = heap.alloc_stack(param_len + code_block.local_types().len());
                 let stack_under = stack_pointer - param_len;
 
                 locals.extend_from_slice(&value_stack[stack_under..stack_under + param_len]);
-                for _ in body.local_types() {
-                    locals
-                        .push(WasmStackValue::zero())
-                        .map_err(|_| WasmRuntimeError::InternalInconsistency)?;
+                for _ in code_block.local_types() {
+                    let _ = locals.push(WasmStackValue::zero());
                 }
 
-                self.func_index = func.index();
-                let result = self.interpret(info, locals.as_mut_slice(), result_types, stack)?;
-                if !result.is_empty() {
-                    let var = value_stack
-                        .get_mut(stack_under)
-                        .ok_or(WasmRuntimeError::InternalInconsistency)?;
-                    *var = WasmStackValue::from(result);
-                }
-                self.func_index = current_function;
-                Ok(())
+                self.func_index = target.index();
+
+                self.interpret(code_block, locals.as_mut_slice(), result_types, heap)
+                    .and_then(|v| {
+                        if let Some(result) = v {
+                            let var = unsafe { value_stack.get_unchecked_mut(stack_under) };
+                            *var = WasmStackValue::from(result);
+                        }
+                        self.func_index = current_function;
+                        Ok(())
+                    })
             })
-        } else if let Some(dlink) = func.dlink() {
-            stack.snapshot(|stack| {
-                let mut locals = stack.alloc_stack(param_len);
+        } else if let Some(dlink) = target.dlink() {
+            heap.snapshot(|heap| {
+                let mut locals = heap.alloc_stack(param_len);
                 let stack_under = stack_pointer - param_len;
                 let params = &value_stack[stack_under..stack_under + param_len];
-                for (index, val_type) in func.param_types().iter().enumerate() {
-                    locals
-                        .push(params[index].get_by_type(*val_type))
-                        .map_err(|_| WasmRuntimeError::InternalInconsistency)?;
+                for (index, val_type) in target.param_types().iter().enumerate() {
+                    let _ = locals.push(params[index].get_by_type(*val_type));
                 }
 
-                let result = dlink(module, locals.as_slice())?;
+                let result = match dlink(module, locals.as_slice()) {
+                    Ok(v) => v,
+                    Err(e) => return Err(self.error(e, code)),
+                };
 
                 if let Some(t) = result_types.first() {
                     if result.is_valid_type(*t) {
-                        let var = value_stack
-                            .get_mut(stack_under)
-                            .ok_or(WasmRuntimeError::InternalInconsistency)?;
+                        let var = match value_stack.get_mut(stack_under) {
+                            Some(v) => v,
+                            None => {
+                                return Err(self.error(WasmRuntimeErrorType::TypeMismatch, code))
+                            }
+                        };
                         *var = WasmStackValue::from(result);
                     } else {
-                        return Err(WasmRuntimeError::TypeMismatch);
+                        return Err(self.error(WasmRuntimeErrorType::TypeMismatch, code));
                     }
                 }
                 Ok(())
             })
         } else {
-            return Err(WasmRuntimeError::NoMethod);
+            Err(self.error(WasmRuntimeErrorType::NoMethod, code))
         }
     }
 }
 
-struct WasmIntermediateCodeBlock<'a> {
+struct WasmIntermediateCodeStream<'a> {
     codes: &'a [WasmImc],
     position: usize,
 }
 
-impl<'a> WasmIntermediateCodeBlock<'a> {
+impl<'a> WasmIntermediateCodeStream<'a> {
     #[inline]
     fn from_codes(codes: &'a [WasmImc]) -> Self {
         Self { codes, position: 0 }
     }
 }
 
-impl WasmIntermediateCodeBlock<'_> {
+impl WasmIntermediateCodeStream<'_> {
     #[inline]
     fn fetch(&mut self) -> Option<&WasmImc> {
         self.codes.get(self.position).map(|v| {
@@ -1347,28 +1018,28 @@ impl WasmIntermediateCodeBlock<'_> {
 }
 
 pub trait WasmInvocation {
-    fn invoke(&self, params: &[WasmValue]) -> Result<WasmValue, WasmIntrError>;
+    fn invoke(&self, params: &[WasmValue]) -> Result<Option<WasmValue>, WasmRuntimeError>;
 }
 
 impl WasmInvocation for WasmRunnable<'_> {
-    fn invoke(&self, params: &[WasmValue]) -> Result<WasmValue, WasmIntrError> {
+    fn invoke(&self, params: &[WasmValue]) -> Result<Option<WasmValue>, WasmRuntimeError> {
         let function = self.function();
-        let body = function
-            .body()
-            .ok_or(WasmIntrError::from(WasmRuntimeError::NoMethod))?;
+        let code_block = function
+            .code_block()
+            .ok_or(WasmRuntimeError::from(WasmRuntimeErrorType::NoMethod))?;
 
         let mut locals =
-            Vec::with_capacity(function.param_types().len() + body.local_types().len());
+            Vec::with_capacity(function.param_types().len() + code_block.local_types().len());
         for (index, param_type) in function.param_types().iter().enumerate() {
-            let param = params
-                .get(index)
-                .ok_or(WasmIntrError::from(WasmRuntimeError::InvalidParameter))?;
+            let param = params.get(index).ok_or(WasmRuntimeError::from(
+                WasmRuntimeErrorType::InvalidParameter,
+            ))?;
             if !param.is_valid_type(*param_type) {
-                return Err(WasmRuntimeError::InvalidParameter.into());
+                return Err(WasmRuntimeErrorType::InvalidParameter.into());
             }
             locals.push(WasmStackValue::from(param.clone()));
         }
-        for _ in body.local_types() {
+        for _ in code_block.local_types() {
             locals.push(WasmStackValue::zero());
         }
 
@@ -1377,551 +1048,268 @@ impl WasmInvocation for WasmRunnable<'_> {
         let mut interp = WasmInterpreter::new(self.module());
         interp.invoke(
             function.index(),
-            body.block_info(),
+            code_block,
             locals.as_slice(),
             result_types,
         )
     }
 }
 
-#[derive(Debug)]
-pub struct WasmIntrError {
-    kind: WasmRuntimeError,
+pub struct WasmRuntimeError {
+    kind: WasmRuntimeErrorType,
     function: usize,
-    code: WasmImc,
+    position: usize,
+    opcode: WasmOpcode,
 }
 
-impl WasmIntrError {
+impl WasmRuntimeError {
     #[inline]
-    pub const fn kind(&self) -> WasmRuntimeError {
+    pub const fn kind(&self) -> WasmRuntimeErrorType {
         self.kind
+    }
+
+    #[inline]
+    pub const fn function(&self) -> usize {
+        self.function
+    }
+
+    #[inline]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+
+    #[inline]
+    pub const fn opcode(&self) -> WasmOpcode {
+        self.opcode
     }
 }
 
-impl From<WasmRuntimeError> for WasmIntrError {
+impl From<WasmRuntimeErrorType> for WasmRuntimeError {
     #[inline]
-    fn from(kind: WasmRuntimeError) -> Self {
+    fn from(kind: WasmRuntimeErrorType) -> Self {
         Self {
             kind,
             function: 0,
-            code: WasmImc::from_mnemonic(WasmIntMnemonic::Unreachable),
+            position: 0,
+            opcode: WasmOpcode::Unreachable,
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
+impl fmt::Debug for WasmRuntimeError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let opcode = self.opcode();
+        write!(
+            f,
+            "{:?} (function {} position {:x} bytecode {:02x} {})",
+            self.kind(),
+            self.function(),
+            self.position(),
+            opcode as usize,
+            opcode.to_str(),
+        )
+    }
+}
 
-    use super::{WasmInterpreter, WasmInvocation};
-    use crate::wasm::{
-        Leb128Stream, WasmBlockInfo, WasmDecodeError, WasmLoader, WasmModule, WasmValType,
-    };
+/// A shared data type for storing in the value stack in the WebAssembly interpreter.
+///
+/// The internal representation is `union`, so information about the type needs to be provided externally.
+#[derive(Copy, Clone)]
+pub union WasmStackValue {
+    i32: i32,
+    u32: u32,
+    i64: i64,
+    u64: u64,
+    f32: f32,
+    f64: f64,
+}
 
-    #[test]
-    fn add() {
-        let slice = [0x20, 0, 0x20, 1, 0x6A, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [1234.into(), 5678.into()];
-
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 6912);
-
-        let params = [0xDEADBEEFu32.into(), 0x55555555.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0x34031444);
+impl WasmStackValue {
+    #[inline]
+    pub const fn zero() -> Self {
+        Self { u64: 0 }
     }
 
-    #[test]
-    fn fused_add() {
-        let slice = [0x20, 0, 0x41, 1, 0x6A, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [1234_5678.into()];
-
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 12345679);
-
-        let params = [0xFFFF_FFFFu32.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
+    #[inline]
+    pub const fn from_bool(v: bool) -> Self {
+        if v {
+            Self::from_i32(1)
+        } else {
+            Self::from_i32(0)
+        }
     }
 
-    #[test]
-    fn sub() {
-        let slice = [0x20, 0, 0x20, 1, 0x6B, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [1234.into(), 5678.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, -4444);
-
-        let params = [0x55555555.into(), 0xDEADBEEFu32.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0x76a79666);
+    #[inline]
+    pub const fn from_i32(v: i32) -> Self {
+        Self { i32: v }
     }
 
-    #[test]
-    fn mul() {
-        let slice = [0x20, 0, 0x20, 1, 0x6C, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [1234.into(), 5678.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 7006652);
-
-        let params = [0x55555555.into(), 0xDEADBEEFu32.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0x6070c05b);
+    #[inline]
+    pub const fn from_u32(v: u32) -> Self {
+        Self { u32: v }
     }
 
-    #[test]
-    fn div_s() {
-        let slice = [0x20, 0, 0x20, 1, 0x6D, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [7006652.into(), 5678.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1234);
-
-        let params = [42.into(), (-6).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, -7);
-
-        let params = [(-42).into(), (6).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, -7);
-
-        let params = [(-42).into(), (-6).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 7);
+    #[inline]
+    pub const fn from_i64(v: i64) -> Self {
+        Self { i64: v }
     }
 
-    #[test]
-    fn div_u() {
-        let slice = [0x20, 0, 0x20, 1, 0x6E, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [7006652.into(), 5678.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1234);
-
-        let params = [42.into(), (-6).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [(-42).into(), (6).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 715827875);
+    #[inline]
+    pub const fn from_u64(v: u64) -> Self {
+        Self { u64: v }
     }
 
-    #[test]
-    fn select() {
-        let slice = [0x20, 0, 0x20, 1, 0x20, 2, 0x1B, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [123.into(), 456.into(), 789.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 123);
-
-        let params = [123.into(), 456.into(), 0.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 456);
+    #[inline]
+    pub fn get_bool(&self) -> bool {
+        unsafe { self.i32 != 0 }
     }
 
-    #[test]
-    fn lts() {
-        let slice = [0x20, 0, 0x20, 1, 0x48, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [123.into(), 456.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
-
-        let params = [123.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [456.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [123.into(), (-456).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [456.into(), (-123).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
+    #[inline]
+    pub fn get_i32(&self) -> i32 {
+        unsafe { self.i32 }
     }
 
-    #[test]
-    fn ltu() {
-        let slice = [0x20, 0, 0x20, 1, 0x49, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [123.into(), 456.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
-
-        let params = [123.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [456.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [123.into(), (-456).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
-
-        let params = [456.into(), (-123).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
+    #[inline]
+    pub fn get_u32(&self) -> u32 {
+        unsafe { self.u32 }
     }
 
-    #[test]
-    fn les() {
-        let slice = [0x20, 0, 0x20, 1, 0x4C, 0x0B];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [123.into(), 456.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
-
-        let params = [123.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 1);
-
-        let params = [456.into(), 123.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [123.into(), (-456).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
-
-        let params = [456.into(), (-123).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 0);
+    #[inline]
+    pub fn get_i64(&self) -> i64 {
+        unsafe { self.i64 }
     }
 
-    #[test]
-    fn br_table() {
-        let slice = [
-            0x02, 0x40, 0x02, 0x40, 0x0b, 0x0b, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x20, 0x00,
-            0x0e, 0x02, 0x00, 0x01, 0x02, 0x0b, 0x41, 0xfb, 0x00, 0x0f, 0x0b, 0x41, 0xc8, 0x03,
-            0x0f, 0x0b, 0x41, 0x95, 0x06, 0x0b,
-        ];
-        let local_types = [WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [0.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 123);
-
-        let params = [1.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 456);
-
-        let params = [2.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 789);
-
-        let params = [3.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 789);
-
-        let params = [4.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 789);
-
-        let params = [5.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 789);
-
-        let params = [(-1).into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 789);
+    #[inline]
+    pub fn get_u64(&self) -> u64 {
+        unsafe { self.u64 }
     }
 
-    #[test]
-    fn app_factorial() {
-        let slice = [
-            0x41, 0x01, 0x21, 0x01, 0x02, 0x40, 0x03, 0x40, 0x20, 0x00, 0x45, 0x0d, 0x01, 0x20,
-            0x01, 0x20, 0x00, 0x6c, 0x21, 0x01, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x21, 0x00, 0x0c,
-            0x00, 0x0b, 0x0b, 0x20, 0x01, 0x0b,
-        ];
-        let local_types = [WasmValType::I32, WasmValType::I32];
-        let result_types = [WasmValType::I32];
-        let mut stream = Leb128Stream::from_slice(&slice);
-        let module = WasmModule::new();
-        let info =
-            WasmBlockInfo::analyze(0, &mut stream, &local_types, &result_types, &module).unwrap();
-        let mut interp = WasmInterpreter::new(&module);
-
-        let params = [7.into(), 0.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 5040);
-
-        let params = [10.into(), 0.into()];
-        let result = interp
-            .invoke(0, &info, &params, &result_types)
-            .unwrap()
-            .get_i32()
-            .unwrap();
-        assert_eq!(result, 3628800);
+    #[inline]
+    pub fn get_f32(&self) -> f32 {
+        unsafe { self.f32 }
     }
 
-    #[test]
-    fn app_fibonacci() {
-        let slice = [
-            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01, 0x7F,
-            0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x0A, 0x31, 0x01, 0x2F, 0x01, 0x01, 0x7F, 0x41,
-            0x00, 0x21, 0x01, 0x02, 0x40, 0x03, 0x40, 0x20, 0x00, 0x41, 0x02, 0x49, 0x0D, 0x01,
-            0x20, 0x00, 0x41, 0x7F, 0x6A, 0x10, 0x00, 0x20, 0x01, 0x6A, 0x21, 0x01, 0x20, 0x00,
-            0x41, 0x7E, 0x6A, 0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x00, 0x20, 0x01, 0x6A,
-            0x0B,
-        ];
+    #[inline]
+    pub fn get_f64(&self) -> f64 {
+        unsafe { self.f64 }
+    }
 
-        let module =
-            WasmLoader::instantiate(&slice, |_, _, _| Err(WasmDecodeError::DynamicLinkError))
-                .unwrap();
-        let runnable = module.func_by_index(0).unwrap();
+    #[inline]
+    pub fn get_i8(&self) -> i8 {
+        unsafe { self.u32 as i8 }
+    }
 
-        let result = runnable.invoke(&[5.into()]).unwrap().get_i32().unwrap();
-        assert_eq!(result, 5);
+    #[inline]
+    pub fn get_u8(&self) -> u8 {
+        unsafe { self.u32 as u8 }
+    }
 
-        let result = runnable.invoke(&[10.into()]).unwrap().get_i32().unwrap();
-        assert_eq!(result, 55);
+    #[inline]
+    pub fn get_i16(&self) -> i16 {
+        unsafe { self.u32 as i16 }
+    }
 
-        let result = runnable.invoke(&[20.into()]).unwrap().get_i32().unwrap();
-        assert_eq!(result, 6765);
+    #[inline]
+    pub fn get_u16(&self) -> u16 {
+        unsafe { self.u32 as u16 }
+    }
+
+    /// Retrieves the value held by the instance as a value of type `i32` and re-stores the value processed by the closure.
+    #[inline]
+    pub fn map_i32<F>(&mut self, f: F)
+    where
+        F: FnOnce(i32) -> i32,
+    {
+        let val = unsafe { self.i32 };
+        self.i32 = f(val);
+    }
+
+    /// Retrieves the value held by the instance as a value of type `u32` and re-stores the value processed by the closure.
+    #[inline]
+    pub fn map_u32<F>(&mut self, f: F)
+    where
+        F: FnOnce(u32) -> u32,
+    {
+        let val = unsafe { self.u32 };
+        self.u32 = f(val);
+    }
+
+    /// Retrieves the value held by the instance as a value of type `i64` and re-stores the value processed by the closure.
+    #[inline]
+    pub fn map_i64<F>(&mut self, f: F)
+    where
+        F: FnOnce(i64) -> i64,
+    {
+        let val = unsafe { self.i64 };
+        self.i64 = f(val);
+    }
+
+    /// Retrieves the value held by the instance as a value of type `u64` and re-stores the value processed by the closure.
+    #[inline]
+    pub fn map_u64<F>(&mut self, f: F)
+    where
+        F: FnOnce(u64) -> u64,
+    {
+        let val = unsafe { self.u64 };
+        self.u64 = f(val);
+    }
+
+    /// Converts the value held by the instance to the `WasmValue` type as a value of the specified type.
+    #[inline]
+    pub fn get_by_type(&self, val_type: WasmValType) -> WasmValue {
+        match val_type {
+            WasmValType::I32 => WasmValue::I32(self.get_i32()),
+            WasmValType::I64 => WasmValue::I64(self.get_i64()),
+            // WasmValType::F32 => {}
+            // WasmValType::F64 => {}
+            _ => todo!(),
+        }
+    }
+}
+
+impl From<bool> for WasmStackValue {
+    #[inline]
+    fn from(v: bool) -> Self {
+        Self::from_bool(v)
+    }
+}
+
+impl From<u32> for WasmStackValue {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Self::from_u32(v)
+    }
+}
+
+impl From<i32> for WasmStackValue {
+    #[inline]
+    fn from(v: i32) -> Self {
+        Self::from_i32(v)
+    }
+}
+
+impl From<u64> for WasmStackValue {
+    #[inline]
+    fn from(v: u64) -> Self {
+        Self::from_u64(v)
+    }
+}
+
+impl From<i64> for WasmStackValue {
+    #[inline]
+    fn from(v: i64) -> Self {
+        Self::from_i64(v)
+    }
+}
+
+impl From<WasmValue> for WasmStackValue {
+    #[inline]
+    fn from(v: WasmValue) -> Self {
+        match v {
+            WasmValue::I32(v) => Self::from_i64(v as i64),
+            WasmValue::I64(v) => Self::from_i64(v),
+            _ => todo!(),
+        }
     }
 }

@@ -198,6 +198,7 @@ impl KeyboardState {
     }
 }
 
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone)]
 pub struct KeyEvent(NonZeroU32);
 

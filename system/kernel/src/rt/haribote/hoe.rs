@@ -560,11 +560,11 @@ impl BinaryLoader for HrbBinaryLoader {
         Ok(())
     }
 
-    fn invoke_start(self: Box<Self>) -> Option<ThreadHandle> {
+    fn invoke_start(self: Box<Self>) -> Option<ProcessId> {
         let cmdline = self.lio.argv.join(" ");
         SpawnOption::new()
             .personality(Hoe::new(self.ctx, cmdline))
-            .spawn(Self::start, 0, self.lio.name.as_ref())
+            .start_process(Self::start, 0, self.lio.name.as_ref())
     }
 }
 

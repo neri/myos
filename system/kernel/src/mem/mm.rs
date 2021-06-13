@@ -82,7 +82,7 @@ impl MemoryManager {
 
     pub(crate) unsafe fn late_init() {
         PageManager::init_late();
-        SpawnOption::with_priority(Priority::Realtime).spawn(Self::page_thread, 0, "Page Manager");
+        SpawnOption::with_priority(Priority::Realtime).start(Self::page_thread, 0, "Page Manager");
     }
 
     #[allow(dead_code)]
@@ -152,16 +152,6 @@ impl MemoryManager {
             }
         }
         None
-    }
-
-    /// Allocate kernel memory (DEPRECATED)
-    #[deprecated]
-    pub unsafe fn zalloc_legacy(size: usize) -> Option<NonZeroUsize> {
-        let shared = Self::shared();
-        match Layout::from_size_align(size, shared.page_size_min()) {
-            Ok(layout) => Self::zalloc(layout),
-            Err(_) => None,
-        }
     }
 
     /// Allocate kernel memory

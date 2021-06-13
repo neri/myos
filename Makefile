@@ -32,11 +32,11 @@ $(EFI_BOOT):
 $(EFI_VENDOR):
 	mkdir -p $(EFI_VENDOR)
 
-run: install $(OVMF)
-	qemu-system-x86_64 -cpu max -smp 4 -bios $(OVMF) -drive format=raw,file=fat:rw:$(MNT) -rtc base=localtime,clock=host -monitor stdio -device nec-usb-xhci,id=xhci
+run: 
+	qemu-system-x86_64 -machine q35 -cpu max -smp 4 -bios $(OVMF) -drive format=raw,file=fat:rw:$(MNT) -rtc base=localtime,clock=host -monitor stdio -device nec-usb-xhci,id=xhci
 
-runs: install $(OVMF)
-	qemu-system-x86_64 -cpu max -bios $(OVMF) -drive format=raw,file=fat:rw:$(MNT) -rtc base=localtime,clock=host -monitor stdio -device nec-usb-xhci,id=xhci
+runs:
+	qemu-system-x86_64 -machine q35 -cpu max -bios $(OVMF) -drive format=raw,file=fat:rw:$(MNT) -rtc base=localtime,clock=host -monitor stdio -device nec-usb-xhci,id=xhci
 
 boot:
 	(cd boot; cargo build -Zbuild-std --release --target $(EFI_ARCH).json)
@@ -44,7 +44,7 @@ boot:
 kernel:
 	(cd system; cargo build -Zbuild-std --release --target $(KRNL_ARCH).json)
 
-install: $(EFI_VENDOR) $(EFI_BOOT) kernel boot $(BOOT_EFI1) tools/mkinitrd/src/*.rs $(INITRD_FILES) apps
+install: $(EFI_VENDOR) $(EFI_BOOT) kernel boot tools/mkinitrd/src/*.rs $(INITRD_FILES) apps
 	cp $(TARGET_BOOT_EFI) $(BOOT_EFI1)
 	cp $(TARGET_BOOT_EFI) $(BOOT_EFI2)
 	cp $(TARGET_KERNEL) $(KERNEL_BIN)
