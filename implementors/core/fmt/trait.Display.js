@@ -1,0 +1,5 @@
+(function() {var implementors = {};
+implementors["bootprot"] = [{"text":"impl Display for <a class=\"enum\" href=\"bootprot/enum.Platform.html\" title=\"enum bootprot::Platform\">Platform</a>","synthetic":false,"types":["bootprot::Platform"]}];
+implementors["kernel"] = [{"text":"impl Display for <a class=\"struct\" href=\"kernel/system/struct.Version.html\" title=\"struct kernel::system::Version\">Version</a>&lt;'_&gt;","synthetic":false,"types":["kernel::system::Version"]},{"text":"impl Display for <a class=\"struct\" href=\"kernel/sync/atomicflags/struct.AtomicBitflags.html\" title=\"struct kernel::sync::atomicflags::AtomicBitflags\">AtomicBitflags</a>&lt;ThreadAttributes&gt;","synthetic":false,"types":["kernel::sync::atomicflags::AtomicBitflags"]}];
+implementors["megstd"] = [{"text":"impl Display for <a class=\"struct\" href=\"megstd/uuid/struct.Uuid.html\" title=\"struct megstd::uuid::Uuid\">Uuid</a>","synthetic":false,"types":["megstd::uuid::Uuid"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

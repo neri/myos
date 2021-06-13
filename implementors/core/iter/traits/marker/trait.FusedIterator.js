@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["megstd"] = [{"text":"impl FusedIterator for <a class=\"struct\" href=\"megstd/path/struct.Ancestors.html\" title=\"struct megstd::path::Ancestors\">Ancestors</a>&lt;'_&gt;","synthetic":false,"types":["megstd::path::Ancestors"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

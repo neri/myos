@@ -1,0 +1,1 @@
+initSidebarItems({"constant":[["OPTION_CHAR_NONE","Invalid character representation in Rust"]],"mod":[["svc",""],["window",""]]});

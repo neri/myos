@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["HeaderType",""],["SmBios","System Management BIOS Entry Point"],["SmBiosEntryV1",""],["SmBiosHeader","Common definition of SmBios’s structures"]]});

@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["AllocationError",""],["DeallocationError",""],["MemoryMapRequest",""]],"mod":[["alloc",""],["mmio",""],["slab",""]],"struct":[["MProtect",""],["MemoryManager",""]]});

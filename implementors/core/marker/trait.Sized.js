@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["megstd"] = [{"text":"impl !Sized for <a class=\"struct\" href=\"megstd/struct.OsStr.html\" title=\"struct megstd::OsStr\">OsStr</a>","synthetic":true,"types":["megstd::osstr::OsStr"]},{"text":"impl !Sized for <a class=\"struct\" href=\"megstd/path/struct.Path.html\" title=\"struct megstd::path::Path\">Path</a>","synthetic":true,"types":["megstd::path::Path"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["BitmapStrategy",""],["WindowDrawingError",""],["WindowMessage",""],["WindowPostError",""],["WindowSystemEvent",""]],"struct":[["WindowBuilder",""],["WindowHandle",""],["WindowLevel",""],["WindowManager",""],["WindowStyle",""]]});

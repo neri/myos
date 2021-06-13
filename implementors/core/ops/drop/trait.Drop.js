@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["kernel"] = [{"text":"impl&lt;T:&nbsp;?Sized&gt; Drop for <a class=\"struct\" href=\"kernel/sync/struct.MutexGuard.html\" title=\"struct kernel::sync::MutexGuard\">MutexGuard</a>&lt;'_, T&gt;","synthetic":false,"types":["kernel::sync::mutex::MutexGuard"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

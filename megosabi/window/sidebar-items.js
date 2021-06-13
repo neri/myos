@@ -1,0 +1,1 @@
+initSidebarItems({"constant":[["TRANSPARENT_WINDOW","Transparent Window"],["USE_BITMAP32","Use 32bit bitmap in window"]]});

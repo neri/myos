@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Hoe","Contextual structure of the Haribote-OS Emulator subsystem"],["HoeSyscallRegs",""],["HrbBinaryLoader",""],["HrbRecognizer","Recognize .HRB file"]]});

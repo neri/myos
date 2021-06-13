@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["LineBreakMode",""],["TextAlignment",""],["VerticalAlignment",""]],"struct":[["AttributedString",""],["AttributedStringBuilder",""],["LineStatus",""],["TextProcessing",""]]});

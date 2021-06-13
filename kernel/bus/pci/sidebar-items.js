@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["PciBarType",""]],"struct":[["Pci",""],["PciBar","PCI Base Address Register"],["PciCapabilityId",""],["PciClass","A type that defines the PCI class code and interface."],["PciConfigAddress",""],["PciDevice",""],["PciDeviceId",""],["PciVendorId",""]],"trait":[["PciDriver",""],["PciDriverRegistrar",""]]});

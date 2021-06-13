@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["kernel"] = [{"text":"impl&lt;T:&nbsp;?Sized&gt; Deref for <a class=\"struct\" href=\"kernel/sync/struct.MutexGuard.html\" title=\"struct kernel::sync::MutexGuard\">MutexGuard</a>&lt;'_, T&gt;","synthetic":false,"types":["kernel::sync::mutex::MutexGuard"]}];
+implementors["megstd"] = [{"text":"impl Deref for <a class=\"struct\" href=\"megstd/struct.OsString.html\" title=\"struct megstd::OsString\">OsString</a>","synthetic":false,"types":["megstd::osstr::OsString"]},{"text":"impl Deref for <a class=\"struct\" href=\"megstd/path/struct.PathBuf.html\" title=\"struct megstd::path::PathBuf\">PathBuf</a>","synthetic":false,"types":["megstd::path::PathBuf"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

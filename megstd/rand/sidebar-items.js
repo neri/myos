@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["XorShift32",""],["XorShift64",""]],"trait":[["Prng","Pseudo Random Number Generator"],["Rng","Random Number Generator"]]});

@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["kernel"] = [{"text":"impl TryFrom&lt;<a class=\"struct\" href=\"kernel/arch/cpu/struct.DescriptorEntry.html\" title=\"struct kernel::arch::cpu::DescriptorEntry\">DescriptorEntry</a>&gt; for <a class=\"enum\" href=\"kernel/arch/cpu/enum.DefaultSize.html\" title=\"enum kernel::arch::cpu::DefaultSize\">DefaultSize</a>","synthetic":false,"types":["kernel::arch::x86_64::cpu::DefaultSize"]}];
+implementors["megstd"] = [{"text":"impl TryFrom&lt;<a class=\"struct\" href=\"megstd/drawing/struct.Rect.html\" title=\"struct megstd::drawing::Rect\">Rect</a>&gt; for <a class=\"struct\" href=\"megstd/drawing/struct.Coordinates.html\" title=\"struct megstd::drawing::Coordinates\">Coordinates</a>","synthetic":false,"types":["megstd::drawing::coords::Coordinates"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

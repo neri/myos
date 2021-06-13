@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["DirEntry",""],["File",""],["FileType",""],["Metadata",""],["OpenOptions",""],["Permissions",""],["ReadDir",""]]});
